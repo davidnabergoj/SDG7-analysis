@@ -1,0 +1,89 @@
+---
+title: "SDG7 electricity access analysis"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(tibble)
+```
+
+
+```{r}
+
+load_data <- function(path) {
+  df <- read.csv(path, skip=4)
+  df <- df %>%
+    select(-c("Country.Name", "Indicator.Name", "Indicator.Code", "X"))
+  names(df) <- gsub("^X", "", names(df))
+  df
+}
+
+root <- "D:/phd/asef/tutorstvo/sdg7/data/"
+pct_electricity <- load_data(paste(root, "API_EG.ELC.ACCS.ZS_DS2_en_csv_v2_4752360/API_EG.ELC.ACCS.ZS_DS2_en_csv_v2_4752360.csv", sep = ""))
+prod_nuclear <- load_data(paste(root, "API_EG.ELC.NUCL.ZS_DS2_en_csv_v2_4639709/API_EG.ELC.NUCL.ZS_DS2_en_csv_v2_4639709.csv", sep = ""))
+health_expenditure <- load_data(paste(root, "API_SH.XPD.CHEX.GD.ZS_DS2_en_csv_v2_4753887/API_SH.XPD.CHEX.GD.ZS_DS2_en_csv_v2_4753887.csv", sep = ""))
+gdp_usd <- load_data(paste(root, "API_NY.GDP.MKTP.CD_DS2_en_csv_v2_4764266/API_NY.GDP.MKTP.CD_DS2_en_csv_v2_4764266.csv", sep = ""))  # Actually cents??
+gdp_per_capita_usd <- load_data(paste(root, "API_NY.GDP.PCAP.CD_DS2_en_csv_v2_4764339/API_NY.GDP.PCAP.CD_DS2_en_csv_v2_4764339.csv", sep = ""))
+
+get_country_data <- function(country_code, years = 1960:2022) {
+  out <- data.frame(year = years)
+  
+  get_tmp_df <- function(df, colname) {
+    tmp_df <- data.frame(t(df %>% filter(Country.Code == country_code) %>% select(any_of(as.character(years)))))
+    names(tmp_df) <- colname
+    tmp_df$year <- as.integer(rownames(tmp_df))
+    tmp_df
+  }
+  
+  out <- out %>%
+    left_join(get_tmp_df(pct_electricity, "pct_electricity"), by = "year") %>%
+    left_join(get_tmp_df(prod_nuclear, "prod_nuclear"), by = "year") %>%
+    left_join(get_tmp_df(health_expenditure, "health_expenditure"), by = "year") %>%
+    left_join(get_tmp_df(gdp_usd, "gdp_mil_usd") %>% mutate(gdp_mil_usd = gdp_mil_usd / 1000000000), by = "year") %>%
+    left_join(get_tmp_df(gdp_per_capita_usd, "gdp_per_capita_usd"), by = "year") %>%
+    mutate(pct_electricity = pct_electricity / 100.0) %>%  # To percentage
+    mutate(gdp_per_capita_usd_standardized = (gdp_per_capita_usd - mean(gdp_per_capita_usd, na.rm = T)) / sd(gdp_per_capita_usd, na.rm = T))  # Standardize
+  out
+}
+
+country_data <- get_country_data("PAK")
+
+```
+
+```{r}
+library(cmdstanr)
+
+remove_na <- function(x) {
+  mask <- !is.na(x)
+  x[mask]
+}
+
+# model <- cmdstan_model(stan_file = write_stan_file(single_country_model_code))
+model <- cmdstan_model(stan_file = "single_country.stan")
+fit <- model$sample(
+  data = list(
+    n = nrow(country_data),
+    
+    n_obs_y = sum(!is.na(country_data$pct_electricity)),
+    idx_y_observed = as.array((1:nrow(country_data))[!is.na(country_data$pct_electricity)]),
+    idx_y_missing = as.array((1:nrow(country_data))[is.na(country_data$pct_electricity)]),
+    y_observed = as.array( remove_na(country_data$pct_electricity)),
+    
+    n_obs_f1 = sum(!is.na(country_data$gdp_per_capita_usd_standardized)),
+    idx_f1_observed = as.array((1:nrow(country_data))[!is.na(country_data$gdp_per_capita_usd_standardized)]),
+    idx_f1_missing = as.array((1:nrow(country_data))[is.na(country_data$gdp_per_capita_usd_standardized)]),
+    f1_observed = as.array(remove_na(country_data$gdp_per_capita_usd_standardized))
+  ),
+  parallel_chains = 4,
+  seed = 1
+)
+```
+```{r}
+fit$summary()
+
+library(bayesplot)
+bayesplot::mcmc_intervals(fit$draws("y_missing"))
+bayesplot::mcmc_intervals(fit$draws("y"))
+bayesplot::mcmc_intervals(fit$draws(c("alpha_bias", "alpha_w0", "alpha_w1", "beta_bias", "beta_w0", "beta_w1")))
+```

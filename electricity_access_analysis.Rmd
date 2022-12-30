@@ -87,3 +87,22 @@ bayesplot::mcmc_intervals(fit$draws("y_missing"))
 bayesplot::mcmc_intervals(fit$draws("y"))
 bayesplot::mcmc_intervals(fit$draws(c("alpha_bias", "alpha_w0", "alpha_w1", "beta_bias", "beta_w0", "beta_w1")))
 ```
+```{r}
+predicted_percentages <- posterior::as_draws_df(fit$draws("y"))
+predicted_percentages <- predicted_percentages[1:nrow(predicted_percentages), 1:(ncol(predicted_percentages)-3)]
+predicted_percentages <- as.data.frame(predicted_percentages)
+predicted_percentages_q <- apply(predicted_percentages, 2, quantile)[c(2, 3, 4), ]
+predicted_percentages_q <- t(predicted_percentages_q)
+predicted_percentages_q <- data.frame(unname(predicted_percentages_q))
+colnames(predicted_percentages_q) <- c("q25", "q50", "q75")
+predicted_percentages_q$year <- country_data$year
+
+library(ggplot2)
+ggplot(predicted_percentages_q, aes(x = year)) +
+  geom_line(aes(y = q50)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), alpha=0.3) +
+  xlab("Year") +
+  ylab("Percentage of people with electricity") +
+  ggtitle("Access to electricity")
+```
+

@@ -25,6 +25,9 @@ prod_nuclear <- load_data(paste(root, "API_EG.ELC.NUCL.ZS_DS2_en_csv_v2_4639709/
 health_expenditure <- load_data(paste(root, "API_SH.XPD.CHEX.GD.ZS_DS2_en_csv_v2_4753887/API_SH.XPD.CHEX.GD.ZS_DS2_en_csv_v2_4753887.csv", sep = ""))
 gdp_usd <- load_data(paste(root, "API_NY.GDP.MKTP.CD_DS2_en_csv_v2_4764266/API_NY.GDP.MKTP.CD_DS2_en_csv_v2_4764266.csv", sep = ""))  # Actually cents??
 gdp_per_capita_usd <- load_data(paste(root, "API_NY.GDP.PCAP.CD_DS2_en_csv_v2_4764339/API_NY.GDP.PCAP.CD_DS2_en_csv_v2_4764339.csv", sep = ""))
+prod_oil_gas_coal <- load_data(paste(root, "API_EG.ELC.FOSL.ZS_DS2_en_csv_v2_4538179/API_EG.ELC.FOSL.ZS_DS2_en_csv_v2_4538179.csv", sep = ""))
+prod_oil <- load_data(paste(root, "API_EG.ELC.PETR.ZS_DS2_en_csv_v2_4694805/API_EG.ELC.PETR.ZS_DS2_en_csv_v2_4694805.csv", sep = ""))
+prod_renewable_excl_hydroelectric <- load_data(paste(root, "API_EG.ELC.RNWX.KH_DS2_en_csv_v2_4749358/API_EG.ELC.RNWX.KH_DS2_en_csv_v2_4749358.csv", sep = ""))
 
 get_country_data <- function(country_code, years = 1960:2022) {
   out <- data.frame(year = years)
@@ -40,14 +43,17 @@ get_country_data <- function(country_code, years = 1960:2022) {
     left_join(get_tmp_df(pct_electricity, "pct_electricity"), by = "year") %>%
     left_join(get_tmp_df(prod_nuclear, "prod_nuclear"), by = "year") %>%
     left_join(get_tmp_df(health_expenditure, "health_expenditure"), by = "year") %>%
-    left_join(get_tmp_df(gdp_usd, "gdp_mil_usd") %>% mutate(gdp_mil_usd = gdp_mil_usd / 1000000000), by = "year") %>%
     left_join(get_tmp_df(gdp_per_capita_usd, "gdp_per_capita_usd"), by = "year") %>%
+    left_join(get_tmp_df(prod_oil_gas_coal, "prod_oil_gas_coal"), by = "year") %>%
+    left_join(get_tmp_df(prod_oil, "prod_oil"), by = "year") %>%
+    left_join(get_tmp_df(prod_renewable_excl_hydroelectric, "prod_renewable_excl_hydroelectric"), by = "year") %>%
+    
+    left_join(get_tmp_df(gdp_usd, "gdp_mil_usd") %>% mutate(gdp_mil_usd = gdp_mil_usd / 1000000000), by = "year") %>%
     mutate(pct_electricity = pct_electricity / 100.0) %>%  # To percentage
-    mutate(gdp_per_capita_usd_standardized = (gdp_per_capita_usd - mean(gdp_per_capita_usd, na.rm = T)) / sd(gdp_per_capita_usd, na.rm = T))  # Standardize
+    mutate(gdp_per_capita_usd_standardized = (gdp_per_capita_usd - mean(gdp_per_capita_usd, na.rm = T)) / sd(gdp_per_capita_usd, na.rm = T)) %>%  # Standardize
+    mutate(prod_renewable_excl_hydroelectric = (prod_renewable_excl_hydroelectric - mean(prod_renewable_excl_hydroelectric, na.rm = T)) / sd(prod_renewable_excl_hydroelectric, na.rm = T))  # Standardize
   out
 }
-
-country_data <- get_country_data("PAK")
 
 ```
 
@@ -59,45 +65,101 @@ remove_na <- function(x) {
   x[mask]
 }
 
-# model <- cmdstan_model(stan_file = write_stan_file(single_country_model_code))
-model <- cmdstan_model(stan_file = "single_country.stan")
-fit <- model$sample(
-  data = list(
-    n = nrow(country_data),
-    
-    n_obs_y = sum(!is.na(country_data$pct_electricity)),
-    idx_y_observed = as.array((1:nrow(country_data))[!is.na(country_data$pct_electricity)]),
-    idx_y_missing = as.array((1:nrow(country_data))[is.na(country_data$pct_electricity)]),
-    y_observed = as.array( remove_na(country_data$pct_electricity)),
-    
-    n_obs_f1 = sum(!is.na(country_data$gdp_per_capita_usd_standardized)),
-    idx_f1_observed = as.array((1:nrow(country_data))[!is.na(country_data$gdp_per_capita_usd_standardized)]),
-    idx_f1_missing = as.array((1:nrow(country_data))[is.na(country_data$gdp_per_capita_usd_standardized)]),
-    f1_observed = as.array(remove_na(country_data$gdp_per_capita_usd_standardized))
-  ),
-  parallel_chains = 4,
-  seed = 1
-)
+country_data <- get_country_data("ARG")
+
+standardized_country_data <- 
+  cbind(
+    country_data %>% select(c("year")),
+    country_data %>%
+      select(-c("year")) %>%
+      mutate(across(where(is.numeric), scale, center = TRUE))
+  )
+
+get_feature <- function(df, index, feature_name) {
+  feature <- df %>% select(feature_name)
+  L <- list(
+    sum(!is.na(feature)),
+    as.array((1:nrow(df))[!is.na(feature)]),
+    as.array((1:nrow(df))[is.na(feature)]),
+    as.array(remove_na(feature))
+  )
+  names(L) <- c(
+    sprintf("n_obs_f%s", index),
+    sprintf("idx_f%s_observed", index), 
+    sprintf("idx_f%s_missing", index),
+    sprintf("f%s_observed", index)
+  )
+  L
+}
+
+get_fit_brownian <- function(df) {
+  model <- cmdstan_model(stan_file = "single_country_brownian.stan")
+  n <- nrow(df)
+  target <- df %>% select("pct_electricity")
+  model_data <- c(
+    list(
+      n = n,
+      n_obs_y = sum(!is.na(target)),
+      idx_y_observed = as.array((1:n)[!is.na(target)]),
+      idx_y_missing = as.array((1:n)[is.na(target)]),
+      y_observed = as.array(remove_na(target))
+    ),
+    get_feature(df, 1, "health_expenditure"),
+    get_feature(df, 2, "gdp_per_capita_usd"),
+    get_feature(df, 3, "prod_oil_gas_coal"),
+    get_feature(df, 4, "prod_renewable_excl_hydroelectric"),
+    get_feature(df, 5, "prod_oil")
+  )
+  print(names(model_data))
+  print(model_data$idx_f2_observed)
+  print(model_data$idx_f2_missing)
+  print(length(model_data$f2_observed))
+  print(model_data$n_obs_f2)
+  
+  fit <- model$sample(
+    data = model_data,
+    parallel_chains = 4,
+    seed = 1
+  )
+  
+  predicted_percentages <- posterior::as_draws_df(fit$draws("y"))
+  predicted_percentages <- predicted_percentages[1:nrow(predicted_percentages), 1:(ncol(predicted_percentages)-3)]
+  predicted_percentages <- as.data.frame(predicted_percentages)
+  
+  # Average variance of unseen times. Lower => better predictors.
+  average_variance <- mean(apply(predicted_percentages, 2, var)[is.na(target)])
+  
+  return(list(
+    fit = fit,
+    average_variance = average_variance,
+    predicted_percentages = predicted_percentages
+  ))
+}
+
+output <- get_fit_brownian(standardized_country_data)
 ```
+
+
+
 ```{r}
+library(bayesplot)
+library(ggplot2)
+
+fit <- oil_output$fit
+predicted_percentages <- oil_output$predicted_percentages
+
 fit$summary()
 
-library(bayesplot)
 bayesplot::mcmc_intervals(fit$draws("y_missing"))
 bayesplot::mcmc_intervals(fit$draws("y"))
 bayesplot::mcmc_intervals(fit$draws(c("alpha_bias", "alpha_w0", "alpha_w1", "beta_bias", "beta_w0", "beta_w1")))
-```
-```{r}
-predicted_percentages <- posterior::as_draws_df(fit$draws("y"))
-predicted_percentages <- predicted_percentages[1:nrow(predicted_percentages), 1:(ncol(predicted_percentages)-3)]
-predicted_percentages <- as.data.frame(predicted_percentages)
+
 predicted_percentages_q <- apply(predicted_percentages, 2, quantile)[c(2, 3, 4), ]
 predicted_percentages_q <- t(predicted_percentages_q)
 predicted_percentages_q <- data.frame(unname(predicted_percentages_q))
 colnames(predicted_percentages_q) <- c("q25", "q50", "q75")
 predicted_percentages_q$year <- country_data$year
 
-library(ggplot2)
 ggplot(predicted_percentages_q, aes(x = year)) +
   geom_line(aes(y = q50)) +
   geom_ribbon(aes(ymin = q25, ymax = q75), alpha=0.3) +
@@ -105,4 +167,3 @@ ggplot(predicted_percentages_q, aes(x = year)) +
   ylab("Percentage of people with electricity") +
   ggtitle("Access to electricity")
 ```
-
